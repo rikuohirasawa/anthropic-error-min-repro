@@ -12,8 +12,6 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express from 'express';
 import { TOOL_RESPONSE_SIZE } from './utils.mjs';
 
-
-
 const app = express();
 const PORT = process.env.PORT || 3031;
 
@@ -26,7 +24,6 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
     res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id');
-    res.header('ngrok-skip-browser-warning', 'true');
 
     if (req.method === 'OPTIONS') {
         res.sendStatus(200);
@@ -81,7 +78,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
                 {
                     type: 'text',
-                    text: largeData
+                    text: JSON.stringify(largeData),
                 },
             ],
         };

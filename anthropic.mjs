@@ -1,68 +1,20 @@
 #!/usr/bin/env node
+import Anthropic from '@anthropic-ai/sdk';
 
 // Configuration - adjust these for your setup
 const CONFIG = {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-    mcpUrl: process.env.MCP_URL || 'https://vitameric-semiprotected-julianne.ngrok-free.dev',
+    mcpUrl: process.env.MCP_URL,
     maxTokens: 2048,
     sizeKb: 400, // Size of response to request
     // Run test N times to measure reproducibility
     iterations: 5,
 };
 
-console.log('=== MCP LARGE RESPONSE TEST (RAW FETCH) ===\n');
+console.log('=== MCP LARGE RESPONSE TEST ===\n');
 console.log(`Testing MCP with single tool call returning...`);
 console.log(`MCP URL: ${CONFIG.mcpUrl}`);
 console.log(`Iterations: ${CONFIG.iterations}\n`);
-
-// Parse Server-Sent Events (SSE) stream
-async function parseSSEStream(response, onEvent, onError) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            
-            // Keep the last incomplete line in the buffer
-            buffer = lines.pop() || '';
-
-            let currentEvent = null;
-            let currentData = '';
-
-            for (const line of lines) {
-                if (line.startsWith('event: ')) {
-                    currentEvent = line.slice(7).trim();
-                } else if (line.startsWith('data: ')) {
-                    currentData = line.slice(6);
-                    
-                    if (currentEvent && currentData) {
-                        try {
-                            const data = JSON.parse(currentData);
-                            onEvent(currentEvent, data);
-                        } catch (e) {
-                            console.error('Failed to parse SSE data:', e);
-                        }
-                        currentEvent = null;
-                        currentData = '';
-                    }
-                } else if (line === '') {
-                    // Empty line separates events
-                    currentEvent = null;
-                    currentData = '';
-                }
-            }
-        }
-    } catch (error) {
-        onError(error);
-    }
-}
 
 async function testLargeResponse(iteration) {
     console.log(`\n${'='.repeat(70)}`);
@@ -74,6 +26,9 @@ async function testLargeResponse(iteration) {
         process.exit(1);
     }
 
+    const client = new Anthropic({
+        apiKey: CONFIG.anthropicApiKey,
+    });
     const startTime = Date.now();
 
     // Event tracking
@@ -89,174 +44,107 @@ async function testLargeResponse(iteration) {
         completed: false,
     };
 
-    // Store the final message as we build it
-    const finalMessage = {
-        id: null,
-        role: 'assistant',
-        content: [],
-        model: null,
-        stop_reason: null,
-        usage: null,
-    };
-
     try {
-        const requestBody = {
-            model: 'claude-sonnet-4-5',
-            stream: true,
-            max_tokens: CONFIG.maxTokens,
-            thinking: {
-                type: 'enabled',
-                budget_tokens: 1024,
-            },
-            system: [
-                {
-                    type: 'text',
-                    text: 'You are testing MCP tool responses. Call get-data to retrieve the test data. After it completes, say "Data received" and stop.',
+        const stream = client.beta.messages.stream(
+            {
+                model: 'claude-haiku-4-5-20251001',
+                stream: true,
+                max_tokens: CONFIG.maxTokens,
+                thinking: {
+                    type: 'enabled',
+                    budget_tokens: 1024,
                 },
-            ],
-            messages: [
-                {
-                    role: 'user',
-                    content: `Call the get-data tool to retrieve the test data. After it completes, say "Data received" and stop. Do not make any other tool calls.`,
-                },
-            ],
-            mcp_servers: [
-                {
-                    type: 'url',
-                    url: `${CONFIG.mcpUrl}/mcp`,
-                    name: 'Test MCP',
-                    tool_configuration: {
-                        allowed_tools: ['get-data'],
+                system: [
+                    {
+                        type: 'text',
+                        text: 'You are testing MCP tool responses. Call get-data to retrieve the test data. After it completes, say "Data received" and stop.',
                     },
+                ],
+                messages: [
+                    {
+                        role: 'user',
+                        content: `Call the get-data tool to retrieve the test data. After it completes, say "Data received" and stop. Do not make any other tool calls.`,
+                    },
+                ],
+                mcp_servers: [
+                    {
+                        type: 'url',
+                        url: `${CONFIG.mcpUrl}/mcp`,
+                        name: 'Test MCP',
+                        tool_configuration: {
+                            allowed_tools: ['get-data'],
+                        },
+                    },
+                ],
+            },
+            {
+                headers: {
+                    'anthropic-beta': ['mcp-client-2025-04-04', 'interleaved-thinking-2025-05-14'],
                 },
-            ],
-        };
-
-        console.log(`[${Date.now() - startTime}ms] 📡 Making request to Anthropic API...`);
-
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': CONFIG.anthropicApiKey,
-                'anthropic-version': '2023-06-01',
-                'anthropic-beta': 'mcp-client-2025-04-04,interleaved-thinking-2025-05-14',
-            },
-            body: JSON.stringify(requestBody),
-        });
-
-        if (!response.ok) {
-            // Clone to read error body
-            const errorClone = response.clone();
-            const errorBody = await errorClone.text();
-            console.log(`[${Date.now() - startTime}ms] ❌ HTTP Error Response:`, errorBody);
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
-        // Clone the response to log it while still being able to stream it
-        const responseClone = response.clone();
-        
-        // Read the cloned response as text for logging
-        (async () => {
-            try {
-                const rawBody = await responseClone.text();
-                console.log(`[${Date.now() - startTime}ms] 📄 Full response body received (${rawBody.length} bytes)`);
-                console.log(` Raw body: ${rawBody}`);
-                // Optional: uncomment to see full raw SSE stream
-                // console.log('Raw SSE stream:', rawBody);
-            } catch (e) {
-                console.log(`[${Date.now() - startTime}ms] ⚠️ Could not log response body:`, e.message);
-            }
-        })();
-
-        events.connect = true;
-        console.log(`[${Date.now() - startTime}ms] ✅ Connected`);
-
-        // Track current content block
-        let currentBlockIndex = -1;
-
-        await parseSSEStream(
-            response,
-            (eventType, data) => {
-                const elapsed = Date.now() - startTime;
-
-                switch (eventType) {
-                    case 'message_start':
-                        finalMessage.id = data.message.id;
-                        finalMessage.model = data.message.model;
-                        finalMessage.role = data.message.role;
-                        finalMessage.usage = data.message.usage;
-                        break;
-
-                    case 'content_block_start':
-                        currentBlockIndex = data.index;
-                        finalMessage.content[data.index] = data.content_block;
-
-                        const blockType = data.content_block.type;
-                        
-                        if (blockType === 'mcp_tool_use') {
-                            events.mcp_tool_use = true;
-                            console.log(`[${elapsed}ms] 🔧 mcp_tool_use: ${data.content_block.name}`);
-                        } else if (blockType === 'mcp_tool_result') {
-                            events.mcp_tool_result = true;
-                            const size = JSON.stringify(data.content_block).length;
-                            console.log(`[${elapsed}ms] 📦 mcp_tool_result received (${size} bytes)`);
-                        } else if (blockType === 'thinking') {
-                            events.thinking = true;
-                            console.log(`[${elapsed}ms] 💭 thinking`);
-                        } else if (blockType === 'text') {
-                            events.text = true;
-                        }
-                        break;
-
-                    case 'content_block_delta':
-                        if (currentBlockIndex >= 0) {
-                            const block = finalMessage.content[currentBlockIndex];
-                            
-                            if (data.delta.type === 'text_delta') {
-                                block.text = (block.text || '') + data.delta.text;
-                                process.stdout.write('.');
-                            } else if (data.delta.type === 'thinking_delta') {
-                                block.thinking = (block.thinking || '') + data.delta.thinking;
-                            }
-                        }
-                        break;
-
-                    case 'content_block_stop':
-                        // Block completed
-                        break;
-
-                    case 'message_delta':
-                        if (data.delta.stop_reason) {
-                            finalMessage.stop_reason = data.delta.stop_reason;
-                        }
-                        if (data.usage) {
-                            finalMessage.usage = { ...finalMessage.usage, ...data.usage };
-                        }
-                        break;
-
-                    case 'message_stop':
-                        events.message_stop = true;
-                        events.completed = true;
-                        console.log(`\n[${elapsed}ms] ✅ message_stop event`);
-                        break;
-
-                    case 'error':
-                        events.stream_error = data;
-                        console.log(`\n[${elapsed}ms] ❌ Error event:`);
-                        console.log('   Message:', data.error?.message || 'Unknown error');
-                        break;
-                }
-            },
-            (error) => {
-                events.stream_error = error;
-                console.log(`\n[${Date.now() - startTime}ms] ❌ Stream error:`);
-                console.log('   Message:', error.message);
             }
         );
 
+        // Track events
+        stream.on('connect', () => {
+            events.connect = true;
+            console.log(`[${Date.now() - startTime}ms] ✅ Connected`);
+        });
+
+        stream.on('contentBlock', (block) => {
+            const elapsed = Date.now() - startTime;
+
+            switch (block.type) {
+                case 'mcp_tool_use':
+                    events.mcp_tool_use = true;
+                    console.log(`[${elapsed}ms] 🔧 mcp_tool_use: ${block.name}`);
+                    break;
+
+                case 'mcp_tool_result':
+                    events.mcp_tool_result = true;
+                    const size = JSON.stringify(block).length;
+                    console.log(`[${elapsed}ms] 📦 mcp_tool_result received (${size} bytes)`);
+                    break;
+
+                case 'thinking':
+                    events.thinking = true;
+                    console.log(`[${elapsed}ms] 💭 thinking`);
+                    break;
+
+                case 'text':
+                    events.text = true;
+                    process.stdout.write('.');
+                    break;
+            }
+        });
+
+        stream.on('error', (streamError) => {
+            events.stream_error = streamError;
+            console.log(`\n[${Date.now() - startTime}ms] ❌ Stream error event:`);
+            console.log('   Message:', streamError.message);
+            console.log('   Type:', streamError.constructor.name);
+        });
+
+        stream.on('abort', (abortError) => {
+            events.abort = true;
+            console.log(`\n[${Date.now() - startTime}ms] ⚠️ Stream abort event`);
+            if (abortError) {
+                console.log('   Message:', abortError.message);
+            }
+        });
+
+        stream.on('end', () => {
+            events.completed = true;
+            console.log(`\n[${Date.now() - startTime}ms] ✅ Stream end event`);
+        });
+
+        // This is where it typically fails for large responses
+        await stream.done();
+        console.log(`[${Date.now() - startTime}ms] ✅ stream.done()`);
+
+        const finalMessage = await stream.finalMessage();
         const duration = Date.now() - startTime;
-        console.log(`[${duration}ms] ✅ Stream completed\n`);
+
+        console.log(`[${duration}ms] ✅ stream.finalMessage()\n`);
 
         // Results
         console.log('RESULTS:');
@@ -270,7 +158,7 @@ async function testLargeResponse(iteration) {
         console.log(`  abort event: ${events.abort ? '⚠️ YES' : '✅ NO'}`);
         console.log(`  completed event: ${events.completed ? '✅' : '❌'}`);
         console.log(`  Final message content blocks: ${finalMessage.content.length}`);
-        console.log(`  Stop reason: ${finalMessage.stop_reason || 'none'}`);
+        console.log(`  Stop reason: ${finalMessage.stop_reason}`);
 
         const success = events.mcp_tool_result && !events.stream_error && !events.abort;
 
@@ -316,15 +204,17 @@ async function testLargeResponse(iteration) {
             console.log(
                 '🎯 BUG CONFIRMED: Tool was called but result never arrived, no error/abort events!'
             );
-            console.log('   This indicates an API-level issue (not SDK bug).');
+            console.log('   This matches the SDK bug from the GitHub issue.');
         } else if (events.completed && !events.stream_error && !events.abort) {
             console.log(
-                '🎯 Stream completed without errors'
+                '🎯 BUG CONFIRMED: Stream said it completed but finalMessage() threw exception!'
             );
+            console.log('   No error/abort events were fired.');
         }
 
         console.log(`\nVERDICT: ❌ FAILURE`);
         console.log('  - Stream ended with exception');
+        console.log('  - SDK recognized stream as incomplete');
 
         return {
             success: false,
@@ -383,34 +273,38 @@ async function runTests() {
 
     if (failureCount === 0) {
         console.log(`
-✅ ALL TESTS PASSED (RAW FETCH API)
+✅ ALL TESTS PASSED
 
-The MCP response completed successfully in ${CONFIG.iterations} attempts.
-This indicates:
-- The Anthropic API itself is handling the stream correctly
-- The issue may be SDK-specific (if SDK tests fail but raw fetch succeeds)
-- Or the timeout issue is being reproduced (check server logs for 2min timeout)
+The cumulative MCP response did not trigger the bug in ${CONFIG.iterations} attempts.
+This is surprising given the size far exceeds the 400KB web_fetch threshold.
+This could mean:
+- The bug was fixed
+- The bug is highly intermittent and needs many more iterations
+- Server-side factors affect reproducibility
+- Different timing/conditions needed to trigger it
+
+Note: Your production logs showed this happens intermittently.
 `);
     } else if (failureCount === CONFIG.iterations) {
         console.log(`
-🎯 BUG CONSISTENTLY REPRODUCED (RAW FETCH API)
+🎯 BUG CONSISTENTLY REPRODUCED
 
-All ${CONFIG.iterations} tests failed using raw fetch API.
-This confirms the issue is at the API level, not SDK-specific:
+All ${CONFIG.iterations} tests failed with cumulative MCP responses.
+This confirms the bug is consistently triggered by very large cumulative MCP responses.
+
+The pattern matches the GitHub issue #846:
 - Stream receives data but stops emitting events  
 - No error/abort events are fired
-- Stream ends with exception
-
-This is an API-level timeout, likely the MCP tool call timeout (~2 minutes).
+- finalMessage() throws generic exception
 `);
     } else {
         console.log(`
-⚠️ BUG INTERMITTENTLY REPRODUCED (RAW FETCH API)
+⚠️ BUG INTERMITTENTLY REPRODUCED
 
 Failed ${failureCount}/${CONFIG.iterations} times (${Math.round((failureCount / CONFIG.iterations) * 100)}% failure rate).
 
-This confirms the issue exists at the API level and is intermittent.
-This matches production behavior where MCP calls sometimes work, sometimes timeout.
+
+This matches your production experience where enrichment sometimes works, sometimes fails.
 `);
     }
 
