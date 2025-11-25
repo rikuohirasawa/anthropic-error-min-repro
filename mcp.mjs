@@ -12,6 +12,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express from 'express';
 import { TOOL_RESPONSE_SIZE } from './utils.mjs';
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const app = express();
 const PORT = process.env.PORT || 3031;
 
@@ -71,14 +73,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             `[${new Date().toISOString()}] Generating ${Math.round(TOOL_RESPONSE_SIZE / 1024)}KB response...`
         );
 
-        // Generate data to match the target size
-        const largeData = 'x'.repeat(TOOL_RESPONSE_SIZE);
+
+        // sleep for 2 minutes
+        await sleep(120000);
 
         return {
             content: [
                 {
                     type: 'text',
-                    text: JSON.stringify(largeData),
+                    text: 'response from mcp server',
                 },
             ],
         };
