@@ -7,7 +7,7 @@ const CONFIG = {
     mcpUrl: process.env.MCP_URL,
     maxTokens: 4096,
     // Number of CONCURRENT streams (simulates multiple enrichment workflows running at once)
-    concurrentStreams: 30,
+    concurrentStreams: 10,
     // Number of tool calls EACH stream makes (simulates one workflow calling multiple tools)
     toolCallsPerStream: 5,
     // Run the test N times to measure reproducibility
@@ -32,22 +32,35 @@ async function testSingleStream(streamId, startDelay = 0) {
     
     console.log(`\n[Stream ${streamId}] Starting...`);
 
+
     const client = new Anthropic({
         apiKey: CONFIG.anthropicApiKey,
     });
     const startTime = Date.now();
 
+    // Event tracking
+    const events = {
+        connect: false,
+        thinking: false,
+        text: false,
+        mcp_tool_use_count: 0,
+        mcp_tool_result_count: 0,
+        message_stop: false,
+        stream_error: null,
+        abort: false,
+        completed: false,
+    };
+
     try {
-        console.log(`[Stream ${streamId}][${Date.now() - startTime}ms] 🔄 Sending request...`);
-        
-        const message = await client.beta.messages.create(
+        const stream = client.beta.messages.stream(
             {
                 model: 'claude-haiku-4-5-20251001',
+                stream: true,
                 max_tokens: CONFIG.maxTokens,
-                // thinking: {
-                //     type: 'enabled',
-                //     budget_tokens: 1024,
-                // },
+                thinking: {
+                    type: 'enabled',
+                    budget_tokens: 1024,
+                },
                 system: [
                     {
                         type: 'text',
@@ -73,58 +86,101 @@ async function testSingleStream(streamId, startDelay = 0) {
             },
             {
                 headers: {
-                    'anthropic-beta': ['mcp-client-2025-04-04'],
+                    'anthropic-beta': ['mcp-client-2025-04-04', 'interleaved-thinking-2025-05-14'],
                 },
             }
         );
 
-        const duration = Date.now() - startTime;
-        console.log(`[Stream ${streamId}][${duration}ms] ✅ Response received`);
+        // Track events
+        stream.on('connect', () => {
+            events.connect = true;
+            console.log(`[Stream ${streamId}][${Date.now() - startTime}ms] ✅ Connected`);
+        });
 
-        // Count tool uses and results from the message content
-        let mcp_tool_use_count = 0;
-        let mcp_tool_result_count = 0;
+        stream.on('contentBlock', (block) => {
+            const elapsed = Date.now() - startTime;
 
-        for (const block of message.content) {
             switch (block.type) {
                 case 'mcp_tool_use':
-                    mcp_tool_use_count++;
-                    console.log(`[Stream ${streamId}][${duration}ms] 🔧 mcp_tool_use #${mcp_tool_use_count}: ${block.name}`);
+                    events.mcp_tool_use_count++;
+                    console.log(
+                        `[Stream ${streamId}][${elapsed}ms] 🔧 mcp_tool_use #${events.mcp_tool_use_count}: ${block.name}`
+                    );
                     break;
+
                 case 'mcp_tool_result':
-                    mcp_tool_result_count++;
+                    events.mcp_tool_result_count++;
                     const size = JSON.stringify(block).length;
-                    console.log(`[Stream ${streamId}][${duration}ms] 📦 mcp_tool_result #${mcp_tool_result_count} received (${size} bytes)`);
+                    console.log(
+                        `[Stream ${streamId}][${elapsed}ms] 📦 mcp_tool_result #${events.mcp_tool_result_count} received (${size} bytes)`
+                    );
                     break;
-                case 'text':
-                    // Don't log text to reduce noise
-                    break;
+
                 case 'thinking':
+                    events.thinking = true;
                     // Don't log thinking to reduce noise
                     break;
+
+                case 'text':
+                    events.text = true;
+                    // Don't log text to reduce noise
+                    break;
             }
-        }
+        });
+
+        stream.on('error', (streamError) => {
+            events.stream_error = streamError;
+            console.log(`[Stream ${streamId}][${Date.now() - startTime}ms] ❌ Stream error event:`);
+            console.log(`[Stream ${streamId}]    Message:`, streamError.message);
+        });
+
+        stream.on('abort', (abortError) => {
+            events.abort = true;
+            console.log(`[Stream ${streamId}][${Date.now() - startTime}ms] ⚠️ Stream abort event`);
+            if (abortError) {
+                console.log(`[Stream ${streamId}]    Message:`, abortError.message);
+            }
+        });
+
+        stream.on('end', () => {
+            events.completed = true;
+            console.log(`[Stream ${streamId}][${Date.now() - startTime}ms] ✅ Stream end event`);
+        });
+
+        // This is where it typically fails
+        await stream.done();
+        console.log(`[Stream ${streamId}][${Date.now() - startTime}ms] ✅ stream.done()`);
+
+        const finalMessage = await stream.finalMessage();
+        const duration = Date.now() - startTime;
+
+        console.log(`[Stream ${streamId}][${duration}ms] ✅ stream.finalMessage()`);
 
         // Success if we got all the tool results back
         const success =
-            mcp_tool_use_count === CONFIG.toolCallsPerStream &&
-            mcp_tool_result_count === CONFIG.toolCallsPerStream;
+            events.mcp_tool_use_count === CONFIG.toolCallsPerStream &&
+            events.mcp_tool_result_count === CONFIG.toolCallsPerStream &&
+            !events.stream_error &&
+            !events.abort;
 
         const verdict = success ? '✅ SUCCESS' : '❌ FAILURE';
-        console.log(`[Stream ${streamId}] ${verdict} - ${mcp_tool_result_count}/${CONFIG.toolCallsPerStream} tool results (${duration}ms)\n`);
+        console.log(`[Stream ${streamId}] ${verdict} - ${events.mcp_tool_result_count}/${CONFIG.toolCallsPerStream} tool results (${duration}ms)\n`);
 
         return {
             streamId,
             success,
             duration,
-            stopReason: message.stop_reason,
-            toolCallsMade: mcp_tool_use_count,
-            toolResultsReceived: mcp_tool_result_count,
+            stopReason: finalMessage.stop_reason,
+            toolCallsMade: events.mcp_tool_use_count,
+            toolResultsReceived: events.mcp_tool_result_count,
         };
     } catch (error) {
         const duration = Date.now() - startTime;
 
         console.log(`[Stream ${streamId}][${duration}ms] ❌ Exception: ${error.message}`);
+        console.log(
+            `[Stream ${streamId}] 🎯 Made ${events.mcp_tool_use_count} calls, received ${events.mcp_tool_result_count} results`
+        );
         console.log(`[Stream ${streamId}] ❌ FAILURE\n`);
 
         return {
@@ -132,8 +188,8 @@ async function testSingleStream(streamId, startDelay = 0) {
             success: false,
             duration,
             error: error.message,
-            toolCallsMade: 0,
-            toolResultsReceived: 0,
+            toolCallsMade: events.mcp_tool_use_count,
+            toolResultsReceived: events.mcp_tool_result_count,
         };
     }
 }
